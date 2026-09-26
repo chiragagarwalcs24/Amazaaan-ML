@@ -1,0 +1,20 @@
+# Datasets
+dataset/
+data/
+
+# Outputs and Models
+output/
+models/
+*.zip
+*.pkl
+*.csv
+*.tsv
+*.json
+__pycache__/
+*.pyc
+
+# IDEs and environments
+.venv/
+env/
+.vscode/
+.idea/
