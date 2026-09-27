@@ -22,8 +22,8 @@ except ImportError:
     import xgboost as xgb
     USE_LGB = False
 
-S1_TRAIN_SAMPLE = 20_000
-MAX_CANDIDATES  = 50
+S1_TRAIN_SAMPLE = 8_000
+MAX_CANDIDATES  = 100
 OUTPUT_DIR      = "output"
 MODEL_DIR       = "output/model"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -76,8 +76,8 @@ def run_train():
 
     s2_needed = s2_full[s2_full["entity_id"].isin(needed_ids)]
     s3_needed = s3_full[s3_full["entity_id"].isin(needed_ids)]
-    s2_extra_idx = rng.choice(len(s2_full), size=min(15000, len(s2_full)), replace=False)
-    s3_extra_idx = rng.choice(len(s3_full), size=min(15000, len(s3_full)), replace=False)
+    s2_extra_idx = rng.choice(len(s2_full), size=min(80000, len(s2_full)), replace=False)
+    s3_extra_idx = rng.choice(len(s3_full), size=min(80000, len(s3_full)), replace=False)
     s2 = pd.concat([s2_needed, s2_full.iloc[s2_extra_idx]]).drop_duplicates("entity_id").reset_index(drop=True)
     s3 = pd.concat([s3_needed, s3_full.iloc[s3_extra_idx]]).drop_duplicates("entity_id").reset_index(drop=True)
     del s2_full, s3_full
@@ -103,13 +103,23 @@ def run_train():
     )
     evaluate_blocking_recall(pairs_df, gt_full, s1_ids_set)
 
-    print("[7] Computing features in chunks to save memory...", flush=True)
+    print("[7] Creating memory-efficient fast lookup lists...", flush=True)
+    all_map = (
+        {eid: idx for idx, eid in enumerate(all_records["entity_id"])},
+        all_records["name_norm"].fillna("").tolist(),
+        all_records["addr_norm"].fillna("").tolist(),
+        all_records["house_num"].fillna("").tolist(),
+        all_records["name_soundex"].fillna("").tolist(),
+        all_records["country"].fillna("").tolist(),
+    )
+
+    print("[8] Computing features in chunks to save memory...", flush=True)
     chunk_size = 50_000
     feat_chunks = []
     for start in range(0, len(pairs_df), chunk_size):
         end = min(start + chunk_size, len(pairs_df))
         print(f"   Chunk {start:,}/{len(pairs_df):,}...", flush=True)
-        chunk_feat = compute_features(pairs_df.iloc[start:end].copy(), all_records, tfidf=tfidf)
+        chunk_feat = compute_features(pairs_df.iloc[start:end].copy(), all_map, tfidf=tfidf)
         feat_chunks.append(chunk_feat)
     feat_df = pd.concat(feat_chunks, ignore_index=True)
     print(f"   Feature matrix: {feat_df.shape}", flush=True)
@@ -227,29 +237,42 @@ def run_test(chunk_size: int = 10_000):
     valid_all = set(t2_proc["entity_id"]) | set(t3_proc["entity_id"])
     print(f"   Index built: S2 keys={len(idx_s2)}  S3 keys={len(idx_s3)}", flush=True)
 
-    all_match_results  = {}
-    all_candidate_sets = {}
-    t1_records = t1_proc.to_dict("records")
-    total_s1   = len(t1_records)
+    match_path = f"{OUTPUT_DIR}/matching_results.tsv"
+    cand_path  = f"{OUTPUT_DIR}/candidate_pairs.tsv"
+    checkpoint_file = f"{OUTPUT_DIR}/inference_checkpoint.csv"
+
+    total_s1 = len(t1_proc)
+    t1_records = t1_proc.to_dict(orient="records")
     t0 = time.time()
 
-    checkpoint_file = f"{OUTPUT_DIR}/inference_checkpoint.csv"
     processed_chunks = set()
     if os.path.exists(checkpoint_file):
         print(f"   Resuming from checkpoint {checkpoint_file}...", flush=True)
         try:
-            chk_df = pd.read_csv(checkpoint_file, dtype=str)
-            if "chunk_start" in chk_df.columns:
-                processed_chunks = set(chk_df["chunk_start"].astype(int).unique())
-            for _, row in chk_df.iterrows():
-                s1_id = row["source1_entity_id"]
-                c_id = row["candidate_entity_id"]
-                if pd.notna(s1_id) and pd.notna(c_id) and str(s1_id).strip() and str(c_id).strip():
-                    all_match_results.setdefault(s1_id, set()).add(c_id)
+            with open(checkpoint_file, "r") as f:
+                for line in f:
+                    if line.strip().isdigit():
+                        processed_chunks.add(int(line.strip()))
         except Exception as e:
             print(f"   Warning: could not read checkpoint: {e}", flush=True)
     else:
-        pd.DataFrame(columns=["chunk_start", "source1_entity_id", "candidate_entity_id"]).to_csv(checkpoint_file, index=False)
+        with open(checkpoint_file, "w") as f:
+            f.write("chunk_start\n")
+        with open(match_path, "w", encoding="utf-8") as fm:
+            fm.write("source1_entity_id\tmatched_entity_ids\n")
+        with open(cand_path, "w", encoding="utf-8") as fc:
+            fc.write("source1_entity_id\tcandidate_entity_ids\n")
+
+    print(f"[4.5] Creating fast dictionary lookup maps for {len(all_records_test)} records...", flush=True)
+    all_records_test = all_records_test.reset_index(drop=True)
+    all_map_test = (
+        {eid: idx for idx, eid in enumerate(all_records_test["entity_id"])},
+        all_records_test["name_norm"].fillna("").tolist(),
+        all_records_test["addr_norm"].fillna("").tolist(),
+        all_records_test["house_num"].fillna("").tolist(),
+        all_records_test["name_soundex"].fillna("").tolist(),
+        all_records_test["country"].fillna("").tolist(),
+    )
 
     print(f"[5] Running inference in chunks of {chunk_size}...", flush=True)
     for chunk_start in range(0, total_s1, chunk_size):
@@ -262,6 +285,7 @@ def run_test(chunk_size: int = 10_000):
         print(f"   Chunk {chunk_start}/{total_s1} ({pct:.0f}%) -- {elapsed:.0f}s elapsed", flush=True)
 
         cand_rows = []
+        cands_dict = {}
         for s1_row in chunk:
             s1_id   = s1_row["entity_id"]
             name_n  = s1_row.get("name_norm", "")
@@ -272,64 +296,47 @@ def run_test(chunk_size: int = 10_000):
                 idx_s2, idx_s3, ctry_s2, ctry_s3, MAX_CANDIDATES,
             )
             cands = [c for c in cands if c in valid_all]
-            all_candidate_sets[s1_id] = set(cands)
+            cands_dict[s1_id] = cands
             for c_id in cands:
                 cand_rows.append({"source1_entity_id": s1_id, "candidate_entity_id": c_id})
 
         if not cand_rows:
-            pd.DataFrame([{"chunk_start": chunk_start, "source1_entity_id": "", "candidate_entity_id": ""}]).to_csv(checkpoint_file, mode='a', header=False, index=False)
+            # Still write empty outputs for this chunk to keep TSV complete
+            with open(match_path, "a", encoding="utf-8") as fm, open(cand_path, "a", encoding="utf-8") as fc:
+                for s1_row in chunk:
+                    fm.write(f"{s1_row['entity_id']}\t\n")
+                    fc.write(f"{s1_row['entity_id']}\t\n")
+            with open(checkpoint_file, "a") as fchk:
+                fchk.write(f"{chunk_start}\n")
             continue
 
         chunk_pairs = pd.DataFrame(cand_rows).drop_duplicates(
             subset=["source1_entity_id", "candidate_entity_id"]
         ).reset_index(drop=True)
 
-        feat_chunk = compute_features(chunk_pairs, all_records_test, tfidf=tfidf)
+        feat_chunk = compute_features(chunk_pairs, all_map_test, tfidf=tfidf)
         probs = model.predict_proba(feat_chunk[FEATURE_COLS])[:, 1]
         feat_chunk = feat_chunk.copy()
         feat_chunk["prob"] = probs
         matched = feat_chunk[feat_chunk["prob"] >= threshold]
 
         # Fast: groupby instead of iterrows
-        chunk_results = []
+        chunk_results = {}
         for s1_id, group in matched.groupby("source1_entity_id"):
-            cands = group["candidate_entity_id"].tolist()
-            all_match_results.setdefault(s1_id, set()).update(cands)
-            for c in cands:
-                chunk_results.append({"chunk_start": chunk_start, "source1_entity_id": s1_id, "candidate_entity_id": c})
+            chunk_results[s1_id] = group["candidate_entity_id"].tolist()
                 
-        if not chunk_results:
-            chunk_results.append({"chunk_start": chunk_start, "source1_entity_id": "", "candidate_entity_id": ""})
-            
-        pd.DataFrame(chunk_results).to_csv(checkpoint_file, mode='a', header=False, index=False)
+        with open(match_path, "a", encoding="utf-8") as fm, open(cand_path, "a", encoding="utf-8") as fc:
+            for s1_row in chunk:
+                s1_id = s1_row["entity_id"]
+                matches = chunk_results.get(s1_id, [])
+                cands_for_row = cands_dict.get(s1_id, [])
+                fm.write(f"{s1_id}\t{','.join(sorted(set(matches)))}\n")
+                fc.write(f"{s1_id}\t{','.join(sorted(set(cands_for_row)))}\n")
+                
+        with open(checkpoint_file, "a") as fchk:
+            fchk.write(f"{chunk_start}\n")
 
     print(f"   Inference done in {time.time()-t0:.0f}s", flush=True)
-
-    print("[6] Writing output files...", flush=True)
-    match_rows = []
-    for s1_id in all_s1_ids:
-        matches = all_match_results.get(s1_id, set())
-        match_rows.append({
-            "source1_entity_id": s1_id,
-            "matched_entity_ids": ",".join(sorted(matches)),
-        })
-    match_df = pd.DataFrame(match_rows)
-    match_path = f"{OUTPUT_DIR}/matching_results.tsv"
-    match_df.to_csv(match_path, sep="\t", index=False)
-    n_with = (match_df["matched_entity_ids"] != "").sum()
-    print(f"   Saved: {match_path}  ({len(match_df)} rows, {n_with} with matches)", flush=True)
-
-    cand_rows_all = []
-    for s1_id in all_s1_ids:
-        cands = all_candidate_sets.get(s1_id, set())
-        cand_rows_all.append({
-            "source1_entity_id": s1_id,
-            "candidate_entity_ids": ",".join(sorted(cands)),
-        })
-    cand_df = pd.DataFrame(cand_rows_all)
-    cand_path = f"{OUTPUT_DIR}/candidate_pairs.tsv"
-    cand_df.to_csv(cand_path, sep="\t", index=False)
-    print(f"   Saved: {cand_path}", flush=True)
 
     section("TEST PHASE COMPLETE -- Files ready for submission!")
     print(f"\n  Submit to Unstop: {os.path.abspath(match_path)}", flush=True)

@@ -245,29 +245,33 @@ def compute_features(
     -------
     DataFrame with same row order as pairs_df, plus all feature columns.
     """
-    keep = ["entity_id", "name_norm", "addr_norm",
-            "house_num", "name_soundex", "country"]
-    rec_map: Dict[str, dict] = (
-        all_records[keep].set_index("entity_id").to_dict(orient="index")
-    )
+    if isinstance(all_records, tuple):
+        id_to_idx, name_list, addr_list, house_list, soundex_list, country_list = all_records
+    else:
+        # Fallback for old calls (should not happen in optimized code)
+        id_to_idx = {eid: idx for idx, eid in enumerate(all_records["entity_id"])}
+        name_list = all_records["name_norm"].fillna("").tolist()
+        addr_list = all_records["addr_norm"].fillna("").tolist()
+        house_list = all_records["house_num"].fillna("").tolist()
+        soundex_list = all_records["name_soundex"].fillna("").tolist()
+        country_list = all_records["country"].fillna("").tolist()
 
     id1_col = pairs_df["source1_entity_id"].tolist()
     id2_col = pairs_df["candidate_entity_id"].tolist()
     n       = len(pairs_df)
 
     # ── Pull all field arrays at once (one pass) ───────────────────────────
-    empty = {"name_norm": "", "addr_norm": "", "house_num": "",
-             "name_soundex": "", "country": ""}
-    n1_arr  = [rec_map.get(i, empty)["name_norm"]    for i in id1_col]
-    n2_arr  = [rec_map.get(i, empty)["name_norm"]    for i in id2_col]
-    a1_arr  = [rec_map.get(i, empty)["addr_norm"]    for i in id1_col]
-    a2_arr  = [rec_map.get(i, empty)["addr_norm"]    for i in id2_col]
-    h1_arr  = [rec_map.get(i, empty)["house_num"]    for i in id1_col]
-    h2_arr  = [rec_map.get(i, empty)["house_num"]    for i in id2_col]
-    sx1_arr = [rec_map.get(i, empty)["name_soundex"] for i in id1_col]
-    sx2_arr = [rec_map.get(i, empty)["name_soundex"] for i in id2_col]
-    c1_arr  = [rec_map.get(i, empty)["country"]      for i in id1_col]
-    c2_arr  = [rec_map.get(i, empty)["country"]      for i in id2_col]
+    n1_arr  = [name_list[id_to_idx.get(i, 0)][:250]    for i in id1_col]
+    n2_arr  = [name_list[id_to_idx.get(i, 0)][:250]    for i in id2_col]
+    a1_arr  = [addr_list[id_to_idx.get(i, 0)][:250]    for i in id1_col]
+    a2_arr  = [addr_list[id_to_idx.get(i, 0)][:250]    for i in id2_col]
+    h1_arr  = [house_list[id_to_idx.get(i, 0)][:50]    for i in id1_col]
+    h2_arr  = [house_list[id_to_idx.get(i, 0)][:50]    for i in id2_col]
+    sx1_arr = [soundex_list[id_to_idx.get(i, 0)][:50]  for i in id1_col]
+    sx2_arr = [soundex_list[id_to_idx.get(i, 0)][:50]  for i in id2_col]
+    c1_arr  = [country_list[id_to_idx.get(i, 0)][:10]  for i in id1_col]
+    c2_arr  = [country_list[id_to_idx.get(i, 0)][:10]  for i in id2_col]
+
 
     # ── Try rapidfuzz batch (C++) — 50-100x faster than Python loop ────────
     try:

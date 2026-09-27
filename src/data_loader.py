@@ -13,14 +13,7 @@ from typing import Dict
 
 
 # ─── canonical dataset root (relative to project root) ───────────────────────
-DATASET_ROOT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "dataset",
-    "6ab10eb3b23ba_student_resource",
-    "student_resource",
-    "dataset",
-)
+DATASET_ROOT = r"C:\Users\Lenovo\Downloads\6ab10eb3b23ba_student_resource\student_resource\dataset"
 
 
 def _tsv(path: str) -> pd.DataFrame:
